@@ -4,6 +4,7 @@ import { useFolders } from "@/context/folders-context";
 import { useNotes } from "@/context/notes-context";
 import { useAdapter } from "@/context/adapter-context";
 import { useAuth } from "@/context/auth-context";
+import { useSmfs } from "@/context/smfs-context";
 import { DarkModeToggle } from "./dark-mode-toggle";
 import { AuthSection } from "./auth-section";
 import { isTauri } from "@/lib/platform";
@@ -14,6 +15,47 @@ const FOLDER_COLORS = [
     "#EF4444", "#F59E0B", "#10B981", "#3B82F6",
     "#8B5CF6", "#EC4899", "#F97316", "#06B6D4",
 ];
+
+function SmfsSection() {
+    const smfs = useSmfs();
+
+    return (
+        <div className="mt-2">
+            <button
+                onClick={smfs.togglePanel}
+                className="flex items-center justify-between w-full px-3 py-[7px] text-[13px] rounded-xl transition-colors"
+                style={{
+                    color: "var(--color-ink-muted)",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--color-sidebar-active)")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+                <div className="flex items-center gap-2">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+                    </svg>
+                    <span>Supermemory FS</span>
+                </div>
+                <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    style={{
+                        transform: smfs.isOpen ? "rotate(180deg)" : "rotate(0deg)",
+                        transition: "transform 0.2s",
+                    }}
+                >
+                    <polyline points="6 9 12 15 18 9" />
+                </svg>
+            </button>
+        </div>
+    );
+}
 
 export function Sidebar() {
     const navigate = useNavigate();
@@ -242,9 +284,16 @@ export function Sidebar() {
                 </div>
             )}
 
+            {/* SMFS Section - only for authenticated non-anonymous users */}
+            {user && !user.isAnonymous && (
+                <div className="px-3">
+                    <SmfsSection />
+                </div>
+            )}
+
             {/* Auth + Bottom */}
             <AuthSection />
-            {user && !(user as any).isAnonymous && (
+            {user && !user.isAnonymous && (
                 <div className="px-4 py-3 border-t border-[var(--color-border-warm)]/50 space-y-2">
                     <button
                         onClick={() => navigate("/settings/public")}

@@ -137,6 +137,18 @@ export class UserNotesDurableObject extends DurableObject {
                 )
             `);
             migrate("ALTER TABLE media ADD COLUMN caption TEXT");
+
+            // Generic key/value table for SMFS settings on this user. Today
+            // we only store `sandbox_id`, but this is structured as a kv
+            // table (rather than a column on a singleton row) so adding new
+            // settings (e.g. agent prefs, last-seen versions) doesn't require
+            // a schema migration each time.
+            this.sql.exec(`
+                CREATE TABLE IF NOT EXISTS smfs_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            `);
         });
     }
 
@@ -752,6 +764,38 @@ export class UserNotesDurableObject extends DurableObject {
                 "SELECT id, type, filename, r2_key, mime_type, size, width, height, caption, created_at FROM media WHERE published = 1 ORDER BY created_at DESC"
             ).toArray();
             return Response.json(rows);
+        }
+
+        // --- SMFS config routes ---
+        if (request.method === "GET" && path.match(/^\/smfs\/config\/(.+)$/)) {
+            const key = path.split("/")[3];
+            const rows = this.sql.exec("SELECT value FROM smfs_config WHERE key = ?", key).toArray();
+            if (!rows[0]) return new Response("Not found", { status: 404 });
+            return Response.json({ value: rows[0].value });
+        }
+        if (request.method === "POST" && path === "/smfs/config") {
+            const { key, value } = (await request.json()) as { key: string; value: string };
+            this.sql.exec(
+                "INSERT INTO smfs_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                key, value
+            );
+            return Response.json({ ok: true });
+        }
+
+        // SMFS notes for sync
+        if (request.method === "GET" && path === "/smfs/notes-for-sync") {
+            const rows = this.sql.exec(
+                "SELECT id, title, content, updated_at FROM notes WHERE deleted_at IS NULL"
+            ).toArray();
+            return Response.json(rows);
+        }
+        if (request.method === "GET" && path.match(/^\/smfs\/note-for-sync\/(.+)$/)) {
+            const id = path.split("/")[3];
+            const rows = this.sql.exec(
+                "SELECT id, title, content FROM notes WHERE id = ? AND deleted_at IS NULL", id
+            ).toArray();
+            if (!rows[0]) return new Response("Not found", { status: 404 });
+            return Response.json(rows[0]);
         }
 
         return new Response("Not found", { status: 404 });

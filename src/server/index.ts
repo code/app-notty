@@ -6,6 +6,15 @@ import { cors } from "hono/cors";
 import { renderPublicPage, renderPublicNote } from "./public-page";
 import { renderRSS } from "./rss";
 import { generateOgImage } from "./og-image";
+import { Sandbox, FileType, type EntryInfo } from "e2b";
+import { runAgent } from "../lib/smfs-agent";
+import type { SmfsFile, AgentEvent } from "../lib/smfs-types";
+import {
+    postSupermemoryDocument,
+    deleteSupermemoryDocument,
+    type SupermemoryNote,
+} from "../lib/supermemory";
+import type { Context } from "hono";
 
 export { AuthDurableObject } from "../durable-objects/auth";
 export { UserNotesDurableObject } from "../durable-objects/user-notes";
@@ -192,6 +201,70 @@ function getSessionCookie(request: Request): string | null {
     return request.headers.get("X-Session-Token");
 }
 
+async function getSmfsSandbox(userStub: DurableObjectStub): Promise<string | null> {
+    const res = await userStub.fetch(new Request("https://do/smfs/config/sandbox_id"));
+    if (!res.ok) return null;
+    const data = await res.json() as { value: string };
+    return data.value;
+}
+
+/**
+ * Helper for SMFS routes: looks up the user's sandbox id, connects to it, and
+ * runs the supplied handler. Centralizes 400 (no sandbox) and 500 (errors)
+ * responses so individual routes don't need to repeat that boilerplate.
+ */
+async function withSmfsSandbox<T>(
+    c: Context<{ Bindings: Env; Variables: Variables }>,
+    handler: (sandbox: Sandbox) => Promise<Response>,
+    notFoundError = "No sandbox"
+): Promise<Response> {
+    const sandboxId = await getSmfsSandbox(c.var.userStub);
+    if (!sandboxId) return c.json({ error: notFoundError }, 400);
+    try {
+        const sandbox = await Sandbox.connect(sandboxId, { apiKey: process.env.E2B_API_KEY });
+        return await handler(sandbox);
+    } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Sandbox operation failed";
+        return c.json({ error: message }, 500);
+    }
+}
+
+/**
+ * Fetch a single note from the user's DO and upload (upsert) it to
+ * Supermemory under the user's containerTag. No-ops if the note can't be
+ * fetched. Errors thrown by Supermemory propagate so callers can decide
+ * whether to swallow them (waitUntil best-effort) or surface them (bulk sync).
+ */
+async function syncNoteToSupermemory(
+    userStub: DurableObjectStub,
+    apiKey: string,
+    userId: string,
+    noteId: string
+): Promise<void> {
+    const noteRes = await userStub.fetch(new Request(`https://do/smfs/note-for-sync/${noteId}`));
+    if (!noteRes.ok) return;
+    const note = await noteRes.json() as SupermemoryNote;
+    await postSupermemoryDocument(apiKey, note, userId);
+}
+
+/**
+ * Reject SMFS paths that contain shell metacharacters or escape the user's
+ * sandbox home. Used by routes that previously interpolated user input into
+ * shell strings — even though we now use the typed e2b filesystem APIs, we
+ * keep this guard as defence in depth.
+ */
+function isSafeSandboxPath(path: string): boolean {
+    if (!path.startsWith("/home/user")) return false;
+    if (path.includes("..")) return false;
+    if (/[\n\r\0`$"'\\]/.test(path)) return false;
+    return true;
+}
+
+/** Join a parent directory path with a child name, collapsing any `//`. */
+function joinSandboxPath(parent: string, name: string): string {
+    return `${parent}/${name}`.replace(/\/{2,}/g, "/");
+}
+
 // --- Auth routes — proxy to AuthDO, with token exchange for Tauri desktop ---
 app.on(["GET", "POST"], "/api/auth/*", async (c) => {
     const path = new URL(c.req.url).pathname;
@@ -254,26 +327,44 @@ const requireAuth = async (c: any, next: any) => {
 app.use("/api/notes/*", requireAuth);
 app.use("/api/notes-trash", requireAuth);
 app.use("/api/folders/*", requireAuth);
+app.use("/api/smfs/*", requireAuth);
 
 // --- Notes API ---
 app.get("/api/notes", (c) => c.var.userStub.fetch(new Request("https://do/notes")));
 app.post("/api/notes", async (c) => {
     const shareToken = c.req.query("share");
-    if (shareToken) {
-        const body = await c.req.json() as any;
-        if (body.id) {
-            const access = await resolveNoteAccess(c.env, body.id, c.var.userId, shareToken);
-            if (!access) return c.text("Not found", 404);
-            if (access.permission === "view") return c.text("Read only", 403);
-            return access.stub.fetch(new Request("https://do/notes", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            }));
-        }
+    const body = await c.req.json() as any;
+
+    // Share-token branch: write to the *owner's* DO via resolveNoteAccess.
+    // We deliberately do NOT sync to Supermemory here — the note belongs to
+    // another user and is already kept in sync by writes from that owner's
+    // own POST/PUT routes under their user's containerTag.
+    if (shareToken && body.id) {
+        const access = await resolveNoteAccess(c.env, body.id, c.var.userId, shareToken);
+        if (!access) return c.text("Not found", 404);
+        if (access.permission === "view") return c.text("Read only", 403);
+        return access.stub.fetch(new Request("https://do/notes", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        }));
     }
-    return c.var.userStub.fetch(new Request("https://do/notes", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: c.req.raw.body,
+
+    const doRes = await c.var.userStub.fetch(new Request("https://do/notes", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }));
+
+    // Async sync to Supermemory — fetch the saved note from the DO so we use
+    // the persisted content rather than re-reading the request body.
+    const supermemoryKey = process.env.SUPERMEMORY_API_KEY;
+    if (supermemoryKey && body.id && doRes.ok) {
+        const userStub = c.var.userStub;
+        const userId = c.var.userId;
+        c.executionCtx.waitUntil(
+            syncNoteToSupermemory(userStub, supermemoryKey, userId, body.id).catch(() => {})
+        );
+    }
+
+    return doRes;
 });
 
 app.get("/api/notes/:id", async (c) => {
@@ -309,26 +400,61 @@ app.put("/api/notes/:id", async (c) => {
     const access = await resolveNoteAccess(c.env, id, c.var.userId, shareToken);
     if (!access) return c.text("Not found", 404);
     if (access.permission === "view") return c.text("Read only", 403);
-    return access.stub.fetch(new Request("https://do/notes", {
+    const doRes = await access.stub.fetch(new Request("https://do/notes", {
         method: "POST", headers: { "Content-Type": "application/json" }, body,
     }));
+
+    // Sync edits to Supermemory only for the owner's own writes. Edits made
+    // by collaborators via a share token belong to the owner's containerTag
+    // and are kept in sync from the owner's side, so we skip them here.
+    const supermemoryKey = process.env.SUPERMEMORY_API_KEY;
+    if (supermemoryKey && doRes.ok && access.permission === "owner") {
+        const userStub = c.var.userStub;
+        const userId = c.var.userId;
+        c.executionCtx.waitUntil(
+            syncNoteToSupermemory(userStub, supermemoryKey, userId, id).catch(() => {})
+        );
+    }
+
+    return doRes;
 });
 
 
 app.delete("/api/notes/:id", async (c) => {
     const id = c.req.param("id");
     // Only owner can delete
-    return c.var.userStub.fetch(new Request(`https://do/notes/${id}`, { method: "DELETE" }));
+    const res = await c.var.userStub.fetch(new Request(`https://do/notes/${id}`, { method: "DELETE" }));
+    // Remove the note from Supermemory so semantic search doesn't surface it after deletion.
+    const supermemoryKey = process.env.SUPERMEMORY_API_KEY;
+    if (supermemoryKey && res.ok) {
+        c.executionCtx.waitUntil(deleteSupermemoryDocument(supermemoryKey, id).catch(() => {}));
+    }
+    return res;
 });
 
 // Trash
 app.get("/api/notes-trash", (c) => c.var.userStub.fetch(new Request("https://do/notes/trash")));
-app.post("/api/notes/:id/restore", (c) =>
-    c.var.userStub.fetch(new Request(`https://do/notes/${c.req.param("id")}/restore`, { method: "POST" }))
-);
-app.delete("/api/notes/:id/permanent", (c) =>
-    c.var.userStub.fetch(new Request(`https://do/notes/${c.req.param("id")}/permanent`, { method: "DELETE" }))
-);
+app.post("/api/notes/:id/restore", async (c) => {
+    const id = c.req.param("id");
+    const res = await c.var.userStub.fetch(new Request(`https://do/notes/${id}/restore`, { method: "POST" }));
+    // Restoring a note should re-sync it so search reflects current state.
+    const supermemoryKey = process.env.SUPERMEMORY_API_KEY;
+    if (supermemoryKey && res.ok) {
+        c.executionCtx.waitUntil(
+            syncNoteToSupermemory(c.var.userStub, supermemoryKey, c.var.userId, id).catch(() => {})
+        );
+    }
+    return res;
+});
+app.delete("/api/notes/:id/permanent", async (c) => {
+    const id = c.req.param("id");
+    const res = await c.var.userStub.fetch(new Request(`https://do/notes/${id}/permanent`, { method: "DELETE" }));
+    const supermemoryKey = process.env.SUPERMEMORY_API_KEY;
+    if (supermemoryKey && res.ok) {
+        c.executionCtx.waitUntil(deleteSupermemoryDocument(supermemoryKey, id).catch(() => {}));
+    }
+    return res;
+});
 
 // --- Branches ---
 app.get("/api/notes/:id/branches", (c) =>
@@ -780,6 +906,177 @@ app.post("/api/folders", (c) => c.var.userStub.fetch(new Request("https://do/fol
 app.delete("/api/folders/:id", (c) =>
     c.var.userStub.fetch(new Request(`https://do/folders/${c.req.param("id")}`, { method: "DELETE" }))
 );
+
+// --- SMFS API ---
+app.post("/api/smfs/sandbox", async (c) => {
+    if (!process.env.E2B_API_KEY) {
+        return c.json({ error: "E2B_API_KEY not configured — contact the app administrator" }, 500);
+    }
+    let sandboxId = await getSmfsSandbox(c.var.userStub);
+    if (sandboxId) {
+        // Try to connect to verify it's still alive
+        try {
+            const sandbox = await Sandbox.connect(sandboxId, { apiKey: process.env.E2B_API_KEY });
+            await sandbox.files.list("/");
+            return c.json({ sandboxId });
+        } catch {
+            // Sandbox expired or dead, create a new one
+        }
+    }
+    try {
+        const sandbox = await Sandbox.create({ apiKey: process.env.E2B_API_KEY });
+        sandboxId = sandbox.sandboxId;
+        await c.var.userStub.fetch(new Request("https://do/smfs/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: "sandbox_id", value: sandboxId }),
+        }));
+        return c.json({ sandboxId });
+    } catch (err: any) {
+        return c.json({ error: err?.message || "Failed to create sandbox" }, 500);
+    }
+});
+
+app.get("/api/smfs/files", (c) =>
+    withSmfsSandbox(c, async (sandbox) => {
+        const path = c.req.query("path") || "/home/user";
+        if (!isSafeSandboxPath(path)) return c.json({ error: "invalid path" }, 400);
+        const entries: EntryInfo[] = await sandbox.files.list(path);
+        const files: SmfsFile[] = entries.map((e) => ({
+            name: e.name,
+            path: e.path || joinSandboxPath(path, e.name),
+            type: e.type === FileType.DIR ? "directory" as const : "file" as const,
+            size: e.size,
+        }));
+        return c.json({ files });
+    })
+);
+
+app.get("/api/smfs/file", (c) => {
+    const path = c.req.query("path");
+    if (!path || !isSafeSandboxPath(path)) return c.json({ error: "invalid path" }, 400);
+    return withSmfsSandbox(c, async (sandbox) => {
+        const content = await sandbox.files.read(path);
+        return c.json({ content, path });
+    });
+});
+
+app.post("/api/smfs/file", async (c) => {
+    const { path, content } = await c.req.json() as { path: string; content: string };
+    if (!path || !isSafeSandboxPath(path)) return c.json({ error: "invalid path" }, 400);
+    return withSmfsSandbox(c, async (sandbox) => {
+        await sandbox.files.write(path, content);
+        return c.json({ ok: true });
+    });
+});
+
+app.delete("/api/smfs/file", (c) => {
+    const path = c.req.query("path");
+    if (!path || !isSafeSandboxPath(path)) return c.json({ error: "invalid path" }, 400);
+    return withSmfsSandbox(c, async (sandbox) => {
+        // Use the typed e2b filesystem API instead of `rm -rf "${path}"` so
+        // the path can never be interpreted by a shell.
+        await sandbox.files.remove(path);
+        return c.json({ ok: true });
+    });
+});
+
+app.post("/api/smfs/folder", async (c) => {
+    const { path } = await c.req.json() as { path: string };
+    if (!path || !isSafeSandboxPath(path)) return c.json({ error: "invalid path" }, 400);
+    return withSmfsSandbox(c, async (sandbox) => {
+        // Typed API; safe for arbitrary path strings.
+        await sandbox.files.makeDir(path);
+        return c.json({ ok: true });
+    });
+});
+
+app.post("/api/smfs/sync", async (c) => {
+    const apiKey = process.env.SUPERMEMORY_API_KEY;
+    if (!apiKey) return c.json({ error: "SUPERMEMORY_API_KEY not configured" }, 500);
+    const userId = c.var.userId;
+    try {
+        const notesRes = await c.var.userStub.fetch(new Request("https://do/smfs/notes-for-sync"));
+        const notes = await notesRes.json() as SupermemoryNote[];
+        let synced = 0;
+        let errors = 0;
+        for (const note of notes) {
+            try {
+                // postSupermemoryDocument now throws on non-2xx, so we only
+                // increment `synced` on a verified success.
+                await postSupermemoryDocument(apiKey, note, userId);
+                synced++;
+            } catch {
+                errors++;
+            }
+        }
+        return c.json({ synced, errors, total: notes.length });
+    } catch (err: any) {
+        return c.json({ error: err?.message || "Sync failed" }, 500);
+    }
+});
+
+app.post("/api/smfs/agent", async (c) => {
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (!anthropicKey) return c.json({ error: "ANTHROPIC_API_KEY not configured" }, 500);
+
+    const { message, conversationHistory } = await c.req.json() as {
+        message: string;
+        conversationHistory?: Array<{ role: "user" | "assistant"; content: any }>;
+    };
+
+    return withSmfsSandbox(c, async (sandbox) => {
+        const executeBash = async (command: string): Promise<string> => {
+            const result = await sandbox.commands.run(command, { timeoutMs: 30000 });
+            return (result.stdout || "") + (result.stderr ? `\n${result.stderr}` : "");
+        };
+
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const encoder = new TextEncoder();
+
+        // SSE close is idempotent: once we've terminated the stream (after a
+        // `done`/`error` event or an unhandled rejection), late events from
+        // the agent must not crash the request or write to a closed writer.
+        let closed = false;
+        const writeEvent = (event: AgentEvent) => {
+            if (closed) return;
+            writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`)).catch(() => {});
+        };
+        const closeStream = () => {
+            if (closed) return;
+            closed = true;
+            writer.close().catch(() => {});
+        };
+
+        // Run agent in background, close stream when done
+        runAgent({
+            message,
+            conversationHistory: conversationHistory || [],
+            anthropicApiKey: anthropicKey,
+            supermemoryApiKey: process.env.SUPERMEMORY_API_KEY || null,
+            userId: c.var.userId,
+            executeBash,
+            onEvent: (event) => {
+                writeEvent(event);
+                if (event.type === "done" || event.type === "error") {
+                    closeStream();
+                }
+            },
+        }).catch((err) => {
+            writeEvent({ type: "error", message: err?.message || "Agent error" });
+            closeStream();
+        });
+
+        return new Response(readable, {
+            headers: {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        });
+    }, "No sandbox. Initialize one first.");
+});
 
 // --- WebSocket sync ---
 app.get("/api/sync", async (c) => {
